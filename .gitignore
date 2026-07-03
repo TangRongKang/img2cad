@@ -1,0 +1,23 @@
+.claude/
+__MACOSX/
+.DS_Store
+.vscode/
+.venv/
+__pycache__/
+data/
+
+# Model weights
+*.pth
+*.pkl
+
+# Generated outputs
+*.dxf
+*.png
+*.jpg
+*.jpeg
+
+# Directories with generated/test data
+CubiCasa5k/image/
+CubiCasa5k/output_test/
+CubiCasa5k/test/
+CubiCasa5k/runs_cubi/
