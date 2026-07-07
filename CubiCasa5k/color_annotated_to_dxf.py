@@ -379,25 +379,84 @@ def _fit_straight_door(cnt, x_lines, y_lines, wall_t):
 
 
 def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
-    """Trace red door symbols as high-resolution contours.
+    """Trace red door symbols as structured geometry.
 
-    With 4k annotated images the raw contour is already smooth and accurate
-    enough, so we keep every door symbol exactly as the AI coloured it rather
-    than trying to fit rectangles or snap to walls.
+    Swing doors are decomposed into:
+      - a thin rectangular door leaf,
+      - a dashed quarter-circle swing arc,
+      - a straight panel / viewing line.
+    Sliding / pocket doors are kept as one or more thin rectangular outlines.
     """
     cnts, _ = cv2.findContours(red_c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    polys = []
+    doors = []
     for cnt in cnts:
         area = cv2.contourArea(cnt)
         if area < min_area:
             continue
-        peri = cv2.arcLength(cnt, True)
-        eps = max(0.35, peri * 0.0008)
-        approx = cv2.approxPolyDP(cnt, eps, True).reshape(-1, 2)
-        if len(approx) < 3:
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        if bw < 3 or bh < 3:
             continue
-        polys.append([(float(x), float(y)) for x, y in approx])
-    return polys
+
+        roi = red_c[by:by + bh, bx:bx + bw]
+        mh, mw = max(bh // 2, 1), max(bw // 2, 1)
+        q = [int((roi[:mh, :mw] > 0).sum()),   # TL
+             int((roi[:mh, mw:] > 0).sum()),   # TR
+             int((roi[mh:, :mw] > 0).sum()),   # BL
+             int((roi[mh:, mw:] > 0).sum())]   # BR
+        fill = area / (bw * bh)
+        max_q = max(q)
+        min_q = min(q)
+
+        # Swing door: one quadrant is noticeably emptier (quarter-circle sector pattern).
+        is_swing = fill < 0.90 and max_q > 0 and min_q / max_q < 0.60
+
+        if is_swing:
+            eq = int(np.argmin(q))
+            pivot_px = {0: (bx + bw, by + bh), 1: (bx, by + bh),
+                        2: (bx + bw, by),    3: (bx, by)}[eq]
+            sa, ea = {0: (90, 180), 1: (0, 90),
+                      2: (180, 270), 3: (270, 360)}[eq]
+            r_px = (bw + bh) / 2.0
+
+            sa_rad = math.radians(sa)
+            panel_end = (pivot_px[0] + r_px * math.cos(sa_rad),
+                         pivot_px[1] + r_px * math.sin(sa_rad))
+
+            # Thin door leaf centered on the panel line.
+            thickness = max(2.0, min(bw, bh) * 0.08)
+            dx = panel_end[0] - pivot_px[0]
+            dy = panel_end[1] - pivot_px[1]
+            length = math.hypot(dx, dy)
+            if length < 1e-6:
+                continue
+            ux, uy = dx / length, dy / length
+            # Perpendicular unit vector.
+            px, py = -uy, ux
+            half_t = thickness / 2.0
+            leaf = [
+                (pivot_px[0] + px * half_t, pivot_px[1] + py * half_t),
+                (panel_end[0] + px * half_t, panel_end[1] + py * half_t),
+                (panel_end[0] - px * half_t, panel_end[1] - py * half_t),
+                (pivot_px[0] - px * half_t, pivot_px[1] - py * half_t),
+            ]
+
+            doors.append({
+                'type': 'swing',
+                'pivot': (float(pivot_px[0]), float(pivot_px[1])),
+                'radius': float(r_px),
+                'start_angle': float(sa),
+                'end_angle': float(ea),
+                'leaf': [(float(x), float(y)) for x, y in leaf],
+                'panel_line': [(float(pivot_px[0]), float(pivot_px[1])),
+                               (float(panel_end[0]), float(panel_end[1]))],
+            })
+        else:
+            # Sliding / closed-position door: fit an oriented bounding box.
+            rect = cv2.minAreaRect(cnt)
+            box = cv2.boxPoints(rect)
+            box_poly = [(float(x), float(y)) for x, y in box]
+            doors.append({'type': 'sliding', 'rects': [box_poly]})
+    return doors
 
 
 
@@ -425,7 +484,7 @@ def _poly_is_closed(poly, tol=5.0):
     return math.hypot(poly[0][0] - poly[-1][0], poly[0][1] - poly[-1][1]) < tol
 
 
-def _merge_collinear_segments(poly, angle_tol_deg=8.0):
+def _merge_collinear_segments(poly, angle_tol_deg=10.0):
     """Merge consecutive nearly-collinear edges into single straight segments.
 
     Skeletonized diagonal lines appear as pixel staircases; this removes the
@@ -686,7 +745,7 @@ def trace_details(detail_mask, min_length=1, eps_frac=0.001, close_gap=2):
         approx = cv2.approxPolyDP(pts, eps, closed=False)
         merged = _merge_collinear_segments(
             approx.reshape(-1, 2).astype(float).tolist(),
-            angle_tol_deg=8.0,
+            angle_tol_deg=10.0,
         )
         smoothed.append(merged)
     return smoothed
@@ -703,6 +762,9 @@ def emit_dxf(wall_polys, windows, doors, details, scale, x0, y0):
     doc.layers.add('DOORS',   color=1, lineweight=25)
     doc.layers.add('WINDOWS', color=4, lineweight=25)
     doc.layers.add('DETAILS', color=8, lineweight=13)
+    # Dense dashed linetype for door arcs (80 mm dash, 40 mm gap)
+    _lt = doc.linetypes.new('DOOR_DASH', dxfattribs={'description': 'Door arc dashes'})
+    _lt.setup_pattern([120.0, 80.0, -40.0])
 
     for poly in wall_polys:
         if len(poly) >= 3:
@@ -717,10 +779,26 @@ def emit_dxf(wall_polys, windows, doors, details, scale, x0, y0):
             if len(mm) >= 2:
                 msp.add_lwpolyline(mm, close=False, dxfattribs=attr)
 
-    for poly in doors:
-        if len(poly) >= 3:
-            msp.add_lwpolyline(px_to_mm(poly, scale, x0, y0), close=True,
-                               dxfattribs={'layer': 'DOORS'})
+    for door in doors:
+        attr = {'layer': 'DOORS'}
+        if door['type'] == 'swing':
+            # Door leaf: thin rectangle.
+            msp.add_lwpolyline(px_to_mm(door['leaf'], scale, x0, y0),
+                               close=True, dxfattribs=attr)
+            # Swing arc.
+            piv_mm = px_to_mm([door['pivot']], scale, x0, y0)[0]
+            msp.add_arc(center=piv_mm,
+                        radius=door['radius'] * scale,
+                        start_angle=door['start_angle'],
+                        end_angle=door['end_angle'],
+                        dxfattribs={**attr, 'linetype': 'DOOR_DASH'})
+            # Panel / viewing line.
+            msp.add_lwpolyline(px_to_mm(door['panel_line'], scale, x0, y0),
+                               close=False, dxfattribs=attr)
+        else:
+            for rect in door['rects']:
+                msp.add_lwpolyline(px_to_mm(rect, scale, x0, y0),
+                                   close=True, dxfattribs=attr)
 
     for poly in details:
         if len(poly) >= 2:
@@ -745,10 +823,25 @@ def render_preview(shape, wall_polys, windows, doors, details, out_path):
         cv2.polylines(canvas, [np.array(win['poly'], np.int32)], True, (0, 160, 0), 2)
         for pl in win['lines']:
             cv2.polylines(canvas, [np.array(pl, np.int32)], False, (0, 160, 0), 2)
-    for poly in doors:
-        if len(poly) >= 3:
-            cv2.polylines(canvas, [np.array(poly, np.int32).reshape(-1, 1, 2)],
-                          True, (0, 0, 200), 2)
+    for door in doors:
+        if door['type'] == 'swing':
+            leaf = np.array(door['leaf'], np.int32).reshape(-1, 1, 2)
+            cv2.polylines(canvas, [leaf], True, (0, 0, 200), 2)
+            piv = tuple(np.array(door['pivot'], np.int32))
+            r = int(door['radius'])
+            sa, ea = door['start_angle'], door['end_angle']
+            arc_pts = []
+            for i in range(31):
+                a = math.radians(sa + (ea - sa) * i / 30)
+                arc_pts.append([int(piv[0] + r * math.cos(a)),
+                                int(piv[1] - r * math.sin(a))])
+            cv2.polylines(canvas, [np.array(arc_pts, np.int32)], False, (0, 0, 200), 2)
+            line = np.array(door['panel_line'], np.int32)
+            cv2.line(canvas, tuple(line[0]), tuple(line[1]), (0, 0, 200), 2)
+        else:
+            for rect in door['rects']:
+                pts = np.array(rect, np.int32).reshape(-1, 1, 2)
+                cv2.polylines(canvas, [pts], True, (0, 0, 200), 2)
     cv2.imwrite(out_path, canvas)
     print(f'Preview → {out_path}')
 
