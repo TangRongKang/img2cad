@@ -425,6 +425,44 @@ def _poly_is_closed(poly, tol=5.0):
     return math.hypot(poly[0][0] - poly[-1][0], poly[0][1] - poly[-1][1]) < tol
 
 
+def _merge_collinear_segments(poly, angle_tol_deg=8.0):
+    """Merge consecutive nearly-collinear edges into single straight segments.
+
+    Skeletonized diagonal lines appear as pixel staircases; this removes the
+    intermediate zig-zag vertices while keeping real corners intact.
+    """
+    if len(poly) < 3:
+        return poly
+
+    angle_tol = math.radians(angle_tol_deg)
+    result = [poly[0]]
+
+    for i in range(1, len(poly) - 1):
+        p_prev = result[-1]
+        p_curr = poly[i]
+        p_next = poly[i + 1]
+
+        v1 = np.array([p_curr[0] - p_prev[0], p_curr[1] - p_prev[1]])
+        v2 = np.array([p_next[0] - p_curr[0], p_next[1] - p_curr[1]])
+
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-6 or n2 < 1e-6:
+            continue
+
+        cos_ang = float(np.dot(v1, v2) / (n1 * n2))
+        cos_ang = max(-1.0, min(1.0, cos_ang))
+        angle = math.acos(cos_ang)
+
+        if angle < angle_tol:
+            # Skip current vertex — extend the last segment straight to next.
+            continue
+        result.append(p_curr)
+
+    result.append(poly[-1])
+    return result
+
+
 def _reconnect_polylines(polys, reconnect_tol=5.0, angle_tol=60.0):
     """Merge nearby open polylines whose endpoints face each other.
 
@@ -646,7 +684,11 @@ def trace_details(detail_mask, min_length=1, eps_frac=0.001, close_gap=2):
         peri = cv2.arcLength(pts, False)
         eps = max(1.0, peri * eps_frac)
         approx = cv2.approxPolyDP(pts, eps, closed=False)
-        smoothed.append(approx.reshape(-1, 2).astype(float).tolist())
+        merged = _merge_collinear_segments(
+            approx.reshape(-1, 2).astype(float).tolist(),
+            angle_tol_deg=8.0,
+        )
+        smoothed.append(merged)
     return smoothed
 
 

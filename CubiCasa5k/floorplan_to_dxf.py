@@ -103,8 +103,8 @@ def main():
                     help='Output directory (default: same as input)')
     ap.add_argument('--annotated', default=None,
                     help='Use existing color-annotated image instead of calling API')
-    ap.add_argument('--width-mm', type=float, default=None,
-                    help='Real-world floor plan width in mm')
+    ap.add_argument('--width-mm', type=float, default=13700.0,
+                    help='Real-world floor plan width in mm (default: 13700)')
     ap.add_argument('--scale', type=float, default=None,
                     help='mm per pixel (alternative to --width-mm)')
 
