@@ -83,11 +83,10 @@ def get_annotated_image(args):
         sys.exit('Znzmo returned no images.')
 
     ann_img = images[0]
-    # Force the annotated image back to the input size so pixel coordinates
-    # align with the original floor plan even if the AI changed dimensions.
-    if ann_img.size != input_size:
-        print(f'  AI returned size {ann_img.size}, resizing to input size {input_size}')
-        ann_img = ann_img.resize(input_size, Image.LANCZOS)
+    # Keep the AI-returned high-res image for conversion.  Scale is recomputed
+    # from the annotated image's own pixel width, so real-world dimensions stay
+    # correct while benefiting from the higher resolution.
+    print(f'  AI returned annotated image size: {ann_img.size}')
 
     output_dir = Path(args.output_dir) if args.output_dir else input_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
