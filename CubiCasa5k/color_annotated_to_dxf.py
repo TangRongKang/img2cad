@@ -620,7 +620,7 @@ def _skeleton_to_polylines(skel_bool, min_length=15):
     return result
 
 
-def trace_details(detail_mask, min_length=15, eps_frac=0.006, close_gap=1):
+def trace_details(detail_mask, min_length=10, eps_frac=0.003, close_gap=2):
     """Trace detail lines as single centreline polylines.
 
     The old approach traced the boundary of thick strokes (RETR_CCOMP), which
@@ -628,7 +628,8 @@ def trace_details(detail_mask, min_length=15, eps_frac=0.006, close_gap=1):
       1. Bridge tiny gaps in the detail mask so thin strokes stay connected.
       2. Skeletonize the detail mask to a 1-pixel-wide centreline.
       3. Walk the skeleton into individual edge paths.
-      4. Reconnect small gaps between path endpoints.
+      4. Reconnect small gaps between path endpoints (larger tolerance so
+         corners and T-junctions do not break apart).
       5. Slightly smooth each path with approxPolyDP while keeping curves.
       6. Emit closed only if the endpoints actually meet.
 
@@ -644,7 +645,7 @@ def trace_details(detail_mask, min_length=15, eps_frac=0.006, close_gap=1):
 
     skel = skeletonize(detail_mask.astype(bool))
     polys = _skeleton_to_polylines(skel, min_length=min_length)
-    polys = _reconnect_polylines(polys, reconnect_tol=5.0, angle_tol=60.0)
+    polys = _reconnect_polylines(polys, reconnect_tol=8.0, angle_tol=90.0)
 
     smoothed = []
     for poly in polys:
