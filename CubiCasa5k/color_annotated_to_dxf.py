@@ -620,7 +620,7 @@ def _skeleton_to_polylines(skel_bool, min_length=15):
     return result
 
 
-def trace_details(detail_mask, min_length=10, eps_frac=0.003, close_gap=2):
+def trace_details(detail_mask, min_length=3, eps_frac=0.001, close_gap=2):
     """Trace detail lines as single centreline polylines.
 
     The old approach traced the boundary of thick strokes (RETR_CCOMP), which
