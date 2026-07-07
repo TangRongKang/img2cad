@@ -336,162 +336,30 @@ def trace_windows(green_c, x_lines, y_lines, wall_t, min_area=500, min_fill=0.20
     return out
 
 
-# ── stage 3: doors (angle-agnostic: rotated frame/leaf/arc from the red sector) ──
+# ── stage 3: doors (trace red regions as precise closed contours) ────────────────
 
-def _struct_box(mask, cx, cy, half):
-    """Count structure (wall/window) pixels in a square box around (cx, cy)."""
-    H, W = mask.shape
-    y0, y1 = max(0, int(cy - half)), min(H, int(cy + half) + 1)
-    x0, x1 = max(0, int(cx - half)), min(W, int(cx + half) + 1)
-    return int((mask[y0:y1, x0:x1] > 0).sum()) if (y1 > y0 and x1 > x0) else 0
+def trace_doors(red_c, wall_t, min_area=80):
+    """Trace every red region as a precise closed polyline.
 
-
-def _farthest_pair(pts):
-    """The two most-distant points among `pts` (searched on the convex hull)."""
-    hull = cv2.convexHull(pts.astype(np.int32)).reshape(-1, 2).astype(float)
-    best = (0.0, hull[0], hull[0])
-    for i in range(len(hull)):
-        for j in range(i + 1, len(hull)):
-            d = float(np.hypot(*(hull[i] - hull[j])))
-            if d > best[0]:
-                best = (d, hull[i], hull[j])
-    return best
-
-
-def _door_axes(cnt):
-    """Recover a door's geometry from its red quarter-sector — at ANY angle.
-
-    The sector's two arc ends A, B are its farthest-apart pair; the hinge H is the
-    right-angle corner (|HA|=|HB|), which is the centre of the quarter-circle and
-    therefore lies on the SAME side of the chord as the arc bulge.  No
-    horizontal/vertical assumption is made, so 45° (or any) doors are handled like
-    axis-aligned ones.
-    Returns (H, r, armA, armB) or None.
-    """
-    pts = cnt.reshape(-1, 2).astype(float)
-    d, A, B = _farthest_pair(pts)
-    if d < 6:
-        return None
-    mid = (A + B) / 2.0
-    ab = B - A
-    nrm = np.array([-ab[1], ab[0]], float)
-    nrm /= (np.linalg.norm(nrm) + 1e-9)
-    cen = pts.mean(axis=0)
-    h1, h2 = mid + nrm * d / 2, mid - nrm * d / 2
-    # Hinge is the candidate on the arc-bulge side, i.e. closer to the contour
-    # centroid.  The opposite candidate lies outside the sector.
-    H = h1 if np.hypot(*(h1 - cen)) < np.hypot(*(h2 - cen)) else h2
-    r = d / math.sqrt(2.0)
-    armA = (A - H) / (np.linalg.norm(A - H) + 1e-9)
-    armB = (B - H) / (np.linalg.norm(B - H) + 1e-9)
-    return H, r, armA, armB
-
-
-def _perp_thickness(blue, P, s, wall_t):
-    """Wall thickness at P measured along the perpendicular unit dir ±s."""
-    Hh, Ww = blue.shape
-    R = int(wall_t * 2.0) + 2
-
-    def on(t):
-        x = int(round(P[0] + s[0] * t)); y = int(round(P[1] + s[1] * t))
-        return 0 <= x < Ww and 0 <= y < Hh and blue[y, x] > 0
-
-    if not on(0):                              # step onto the nearest wall pixel
-        off = next((k for k in range(1, R) if on(-k) or on(k)), None)
-        if off is None:
-            return 0
-        c = -off if on(-off) else off
-    else:
-        c = 0
-    lo = c
-    while lo - 1 >= -R and on(lo - 1):
-        lo -= 1
-    hi = c
-    while hi + 1 <= R and on(hi + 1):
-        hi += 1
-    return hi - lo + 1
-
-
-def _build_door(H, w, s, wdt, t, arc_n):
-    """Rotated door symbol from hinge H, wall dir w, swing dir s (both unit).
-
-    Frame runs along w by `wdt` and into the wall (−s) by thickness `t`; the leaf
-    is the panel swung 90° into the room (+s), rooted across the frame so it
-    overlaps it at the hinge; the arc is the 90° swing as a sampled polyline.
-    """
-    H = np.asarray(H, float); w = np.asarray(w, float); s = np.asarray(s, float)
-    opening = [H, H + w * wdt, H + w * wdt - s * t, H - s * t]
-    pt = max(wdt * 0.10, 3.0)
-    leaf = [H - s * t, H - s * t + w * pt, H + s * wdt + w * pt, H + s * wdt]
-    arc = [H + wdt * (w * math.cos(a) + s * math.sin(a))
-           for a in np.linspace(0.0, math.pi / 2, arc_n)]
-    tl = lambda P: [(float(p[0]), float(p[1])) for p in P]
-    return {'opening': tl(opening), 'leaf': tl(leaf), 'arc': tl(arc)}
-
-
-def _snap_dir45(v):
-    """Snap a unit direction to the nearest multiple of 45°."""
-    q = round(math.atan2(v[1], v[0]) / (math.pi / 4)) * (math.pi / 4)
-    return np.array([math.cos(q), math.sin(q)])
-
-
-def trace_doors(red_c, blue_mask, struct, wall_t, min_area=200, arc_n=22):
-    """Angle-agnostic doors: each red swing sector → rotated frame + leaf + arc.
-
-    For each sector we recover the hinge and its two arms; the arm whose far end
-    lands on structure is the wall/opening direction, the other is the swing.  A
-    rotated door is built on that frame.  Diagonal and double doors fall out
-    naturally — there is no axis assumption, and each leaf of a double door is its
-    own sector, so the two leaves are simply drawn side by side.
+    Unlike the previous sector-based reconstruction (hinge + leaf + arc), this
+    simply emits the contour of whatever the AI coloured red.  It therefore
+    handles swing doors, sliding doors, double doors, or any other door symbol
+    without assuming a particular geometry — the output hugs the annotated
+    shape as closely as possible.
     """
     cnts, _ = cv2.findContours(red_c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    leaves = []
+    polys = []
     for cnt in cnts:
-        if cv2.contourArea(cnt) < min_area:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
             continue
-        ax = _door_axes(cnt)
-        if ax is not None:
-            leaves.append(list(ax))           # [H, r, armA, armB]
-
-    # Double door: two leaves whose hinges nearly coincide share one opening, and
-    # the opening runs along the line joining their hinges.  Pin each leaf's wall
-    # arm to that line — this resolves cases (e.g. a T-junction) where the simple
-    # "arm ends on structure" test would point the opening the wrong way.
-    wall_of = [None] * len(leaves)
-    for i in range(len(leaves)):
-        for j in range(i + 1, len(leaves)):
-            Hi, ri = leaves[i][0], leaves[i][1]
-            Hj, rj = leaves[j][0], leaves[j][1]
-            sep = np.linalg.norm(Hi - Hj)
-            if sep < 0.7 * min(ri, rj) and sep > 1:
-                d = (Hj - Hi) / sep
-                for k, sgn in ((i, 1.0), (j, -1.0)):
-                    a, b = leaves[k][2], leaves[k][3]
-                    wall_of[k] = a if abs(np.dot(a, d)) >= abs(np.dot(b, d)) else b
-
-    out = []
-    half = max(int(wall_t), 6)
-    for k, (H, r, armA, armB) in enumerate(leaves):
-        if wall_of[k] is not None:
-            w = wall_of[k]
-            s = armB if w is armA else armA
-        else:                                  # single door: wall arm ends on structure
-            eA, eB = H + armA * r, H + armB * r
-            sA = _struct_box(struct, eA[0], eA[1], half)
-            sB = _struct_box(struct, eB[0], eB[1], half)
-            w, s = (armA, armB) if sA >= sB else (armB, armA)
-        # Walls run at multiples of 45°: snap the wall arm (kills the few-degree
-        # arc-fit wobble) and force the swing exactly perpendicular, on the side
-        # the raw swing pointed — a clean right-angle door at any orientation.
-        w = _snap_dir45(w)
-        perp = np.array([-w[1], w[0]])
-        s = perp if np.dot(perp, s) >= 0 else -perp
-        probe = H - w * max(3.0, wall_t * 0.5)     # into the wall stub behind hinge
-        t = _perp_thickness(blue_mask, probe, s, wall_t)
-        if not 0.4 * wall_t <= t <= 3.0 * wall_t:
-            t = wall_t
-        out.append(_build_door(H, w, s, r, t, arc_n))
-    return out
+        peri = cv2.arcLength(cnt, True)
+        eps = max(1.0, peri * 0.005)
+        approx = cv2.approxPolyDP(cnt, eps, True).reshape(-1, 2)
+        if len(approx) < 3:
+            continue
+        polys.append([(float(x), float(y)) for x, y in approx])
+    return polys
 
 
 
@@ -754,7 +622,6 @@ def emit_dxf(wall_polys, windows, doors, details, scale, x0, y0):
     doc.layers.add('DOORS',   color=1, lineweight=25)
     doc.layers.add('WINDOWS', color=4, lineweight=25)
     doc.layers.add('DETAILS', color=8, lineweight=13)
-    doc.linetypes.add('DASHED', [300.0, 200.0, -100.0], description='_ _ _ _')
 
     for poly in wall_polys:
         if len(poly) >= 3:
@@ -769,14 +636,10 @@ def emit_dxf(wall_polys, windows, doors, details, scale, x0, y0):
             if len(mm) >= 2:
                 msp.add_lwpolyline(mm, close=False, dxfattribs=attr)
 
-    for dr in doors:
-        attr = {'layer': 'DOORS'}
-        msp.add_lwpolyline(px_to_mm(dr['opening'], scale, x0, y0), close=True, dxfattribs=attr)
-        msp.add_lwpolyline(px_to_mm(dr['leaf'],    scale, x0, y0), close=True, dxfattribs=attr)
-        arc = px_to_mm(dr['arc'], scale, x0, y0)
-        if len(arc) >= 2:
-            msp.add_lwpolyline(arc, close=False,
-                               dxfattribs={'layer': 'DOORS', 'linetype': 'DASHED'})
+    for poly in doors:
+        if len(poly) >= 3:
+            msp.add_lwpolyline(px_to_mm(poly, scale, x0, y0), close=True,
+                               dxfattribs={'layer': 'DOORS'})
 
     for poly in details:
         if len(poly) >= 2:
@@ -801,10 +664,10 @@ def render_preview(shape, wall_polys, windows, doors, details, out_path):
         cv2.polylines(canvas, [np.array(win['poly'], np.int32)], True, (0, 160, 0), 2)
         for pl in win['lines']:
             cv2.polylines(canvas, [np.array(pl, np.int32)], False, (0, 160, 0), 2)
-    for dr in doors:
-        cv2.polylines(canvas, [np.array(dr['opening'], np.int32)], True, (0, 0, 200), 2)
-        cv2.polylines(canvas, [np.array(dr['leaf'],    np.int32)], True, (0, 0, 200), 2)
-        cv2.polylines(canvas, [np.array(dr['arc'],     np.int32)], False, (0, 0, 200), 2)
+    for poly in doors:
+        if len(poly) >= 3:
+            cv2.polylines(canvas, [np.array(poly, np.int32).reshape(-1, 1, 2)],
+                          True, (0, 0, 200), 2)
     cv2.imwrite(out_path, canvas)
     print(f'Preview → {out_path}')
 
@@ -836,12 +699,12 @@ def convert_annotated_image(img_bgr, output_dxf, width_mm=None, scale=None,
 
     blue_w  = morph_clean(blue, close_k=3, open_k=3, close_iter=1)   # sharp — wall geometry
     blue_c  = smooth_edges(blue_w, sigma=2.0)                        # smoothed — thickness/struct
-    # Doors are thin outline arcs: open(2) to drop speckle, then a strong close to
-    # consolidate each leaf — keeping the swing sector intact so its arms fit clean
-    # (smoothing/large opening would distort the thin arc and corrupt the fit).
+    # Doors are thin outline arcs or rails: open(2) to drop speckle, then a close
+    # to consolidate each symbol — keeping the contour intact so it can be traced
+    # as-is (smoothing/large opening would distort the shape).
     red_o   = cv2.morphologyEx(red, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     red_c   = cv2.morphologyEx(red_o, cv2.MORPH_CLOSE,
-                               cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)), iterations=2)
+                               cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
     green_c = morph_clean(green, close_k=5, open_k=3, close_iter=2)
 
     cols = np.where(blue.any(axis=0))[0]
@@ -864,11 +727,9 @@ def convert_annotated_image(img_bgr, output_dxf, width_mm=None, scale=None,
     # trace → regularise → emit
     wall_polys, x_lines, y_lines = trace_walls(blue_w, wall_t)
     windows = trace_windows(green_c, x_lines, y_lines, wall_t)
-    # Doors are recovered angle-agnostically from the red swing sector; the arm
-    # ending on structure (wall OR window) is the opening, so a door is oriented
-    # correctly whether it sits on a wall, a window, or a 45° diagonal wall.
-    struct = cv2.bitwise_or(blue_w, green_c)
-    doors   = trace_doors(red_c, blue_w, struct, wall_t)
+    # Doors are traced directly as the red-region contours, so swing doors,
+    # sliding doors, and double doors are all handled by the same path.
+    doors   = trace_doors(red_c, wall_t)
     details = [] if no_details else trace_details(make_detail_mask(img_bgr, blue, red, green))
     print(f'Extracted: walls={len(wall_polys)}, doors={len(doors)}, '
           f'windows={len(windows)}, details={len(details)}')
