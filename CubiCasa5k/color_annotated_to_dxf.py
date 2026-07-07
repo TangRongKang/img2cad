@@ -407,6 +407,40 @@ def _extract_long_arc(cnt, p1, p2):
     return [(float(x), float(y)) for x, y in arc.reshape(-1, 2)]
 
 
+def _extract_arc(cnt, p1, p2, pivots=None):
+    """Return the arc path between p1 and p2 on the closed contour.
+
+    The contour of a door sector has two straight radii and a curved outer arc.
+    The straight side is the *longer* path (two radii sum to 2r, arc ≈1.57r), so
+    ``_extract_long_arc`` would pick the wrong side.  Instead, if ``pivots`` are
+    supplied, choose the path that stays farthest from the pivot point(s) — that
+    is the outer curved arc.
+    """
+    pts = cnt.reshape(-1, 2).astype(float)
+    i1 = _nearest_contour_idx(cnt, p1)
+    i2 = _nearest_contour_idx(cnt, p2)
+    if i1 <= i2:
+        path_a = pts[i1:i2 + 1]
+        path_b = np.concatenate([pts[i2:], pts[:i1 + 1]])
+    else:
+        path_a = pts[i2:i1 + 1]
+        path_b = np.concatenate([pts[i1:], pts[:i2 + 1]])
+
+    if pivots is None or len(pivots) == 0:
+        arc = path_a if len(path_a) >= len(path_b) else path_b
+    else:
+        pivots_arr = np.array(pivots, float).reshape(-1, 2)
+
+        def min_dist(path):
+            if len(path) == 0:
+                return 0.0
+            d2 = np.min(np.sum((path[:, None, :] - pivots_arr[None, :, :]) ** 2, axis=2))
+            return math.sqrt(d2)
+
+        arc = path_a if min_dist(path_a) >= min_dist(path_b) else path_b
+    return [(float(x), float(y)) for x, y in arc]
+
+
 def _radius_to_rect(radius, thickness):
     """Convert a line segment (pivot, end) into a thin rectangle."""
     pivot, end = radius
@@ -426,18 +460,55 @@ def _radius_to_rect(radius, thickness):
     ]
 
 
+def _perpendicular_end(pivot, view_end, leaf_end_orig):
+    """Return a leaf endpoint that is exactly perpendicular to the viewing
+    radius, preserving the original leaf length and pointing toward the arc.
+
+    Skeletonized/approximated sectors sometimes have the leaf radius tilted a
+    few degrees; this snaps it to 90° without moving the pivot or the viewing
+    direction.
+    """
+    dx = view_end[0] - pivot[0]
+    dy = view_end[1] - pivot[1]
+    lv = math.hypot(dx, dy)
+    if lv < 1e-6:
+        return leaf_end_orig
+    ux, uy = dx / lv, dy / lv
+    length = math.hypot(leaf_end_orig[0] - pivot[0], leaf_end_orig[1] - pivot[1])
+    # Two perpendicular candidates; keep the one closest to the original leaf end.
+    cands = [(-uy * length, ux * length), (uy * length, -ux * length)]
+    best = leaf_end_orig
+    best_d = float('inf')
+    for cx, cy in cands:
+        cand = (pivot[0] + cx, pivot[1] + cy)
+        d = math.hypot(cand[0] - leaf_end_orig[0], cand[1] - leaf_end_orig[1])
+        if d < best_d:
+            best_d = d
+            best = cand
+    return best
+
+
 def _pick_viewing_radius(radii, x_lines, y_lines):
-    """Pick the radius that best aligns with a wall face line."""
+    """Pick the radius that best aligns with a wall face line.
+
+    The viewing/frame radius should run alongside a wall for its whole length,
+    not just have its midpoint near a wall.  We therefore sample points along
+    each radius and sum their distances to the nearest wall line.
+    """
     def score(radius):
-        pivot, end = radius
-        dx = abs(end[0] - pivot[0])
-        dy = abs(end[1] - pivot[1])
-        mid_x = (pivot[0] + end[0]) / 2.0
-        mid_y = (pivot[1] + end[1]) / 2.0
-        if dx >= dy:  # mostly horizontal
-            return min(abs(mid_y - y) for y in y_lines) if y_lines else float('inf')
-        else:  # mostly vertical
-            return min(abs(mid_x - x) for x in x_lines) if x_lines else float('inf')
+        p1, p2 = radius
+        pts = [(p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1]))
+               for t in np.linspace(0.0, 1.0, 12)]
+        dx = abs(p2[0] - p1[0])
+        dy = abs(p2[1] - p1[1])
+        if dx >= dy:                       # mostly horizontal → compare y
+            if not y_lines:
+                return float('inf')
+            return sum(min(abs(y - yl) for yl in y_lines) for _, y in pts)
+        else:                              # mostly vertical → compare x
+            if not x_lines:
+                return float('inf')
+            return sum(min(abs(x - xl) for xl in x_lines) for x, _ in pts)
 
     scores = [score(r) for r in radii]
     return int(np.argmin(scores))
@@ -461,6 +532,46 @@ def _find_right_angle_corners(approx, lo=70, hi=110):
         cos = max(-1.0, min(1.0, cos))
         angle = math.degrees(math.acos(cos))
         if lo <= angle <= hi:
+            corners.append(i)
+    return corners
+
+
+def _find_axis_aligned_corners(approx, lo=55, hi=105, axis_tol=18.0):
+    """Return right-angle corners where the two edges are axis-aligned.
+
+    In orthogonal floor plans the door frame radius and leaf radius are
+    horizontal/vertical.  This filters out spurious corners formed by an arc
+    vertex that happens to make ~90° with the frame side.
+    """
+    corners = []
+    n = len(approx)
+    axis_tol_rad = math.radians(axis_tol)
+
+    def axis_label(v):
+        ang = math.atan2(abs(v[1]), abs(v[0]))  # [0, pi/2]
+        if ang <= axis_tol_rad:
+            return 'h'
+        if ang >= math.pi / 2 - axis_tol_rad:
+            return 'v'
+        return None
+
+    for i in range(n):
+        p_prev = approx[(i - 1) % n]
+        p_curr = approx[i]
+        p_next = approx[(i + 1) % n]
+        v1 = p_prev - p_curr
+        v2 = p_next - p_curr
+        nv1 = np.linalg.norm(v1)
+        nv2 = np.linalg.norm(v2)
+        if nv1 < 1e-6 or nv2 < 1e-6:
+            continue
+        cos = float(np.dot(v1, v2) / (nv1 * nv2))
+        cos = max(-1.0, min(1.0, cos))
+        angle = math.degrees(math.acos(cos))
+        if not (lo <= angle <= hi):
+            continue
+        a1, a2 = axis_label(v1), axis_label(v2)
+        if a1 and a2 and a1 != a2:
             corners.append(i)
     return corners
 
@@ -515,7 +626,9 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
         if len(approx) < 3:
             continue
 
-        corners = _find_right_angle_corners(approx)
+        corners = _find_axis_aligned_corners(approx)
+        if len(corners) == 0:
+            corners = _find_right_angle_corners(approx)
         if len(corners) == 0:
             # Fall back to oriented rectangle.
             rect = cv2.minAreaRect(cnt)
@@ -559,9 +672,13 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
             if best_pair and best_shared > 80:
                 return 'double', best_pair
 
-            # Single door: pick the corner whose two adjacent edges are longest
-            # (filters out spurious arc-end corners with one very short edge).
+            # Single door: pick the corner whose two adjacent edges are both long
+            # and have comparable length (the two radii of a quarter-circle sector
+            # are roughly equal).  This rejects corners at the end of the wall
+            # opening where one edge is the long frame side and the other is a
+            # short jamb stub.
             best_pivot, best_score = None, -1.0
+            fallback_pivot, fallback_score = None, -1.0
             for c in corners:
                 p = approx[c]
                 p_prev = approx[(c - 1) % n]
@@ -571,12 +688,17 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
                 if d1 < 15 or d2 < 15:
                     continue
                 score = d1 + d2
+                if score > fallback_score:
+                    fallback_score, fallback_pivot = score, c
+                ratio = max(d1, d2) / (min(d1, d2) + 1e-9)
+                if ratio > 3.0:
+                    continue
                 if score > best_score:
                     best_score = score
                     best_pivot = c
 
             if best_pivot is None:
-                best_pivot = corners[0]
+                best_pivot = fallback_pivot if fallback_pivot is not None else corners[0]
             return 'single', best_pivot
 
         kind, info = _classify_corners(approx, corners)
@@ -596,9 +718,12 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
                 leaf1_end = tuple(float(v) for v in approx[(i1 + 1) % n])
                 leaf2_end = tuple(float(v) for v in approx[(i2 - 1) % n])
 
-            leaf1 = _radius_to_rect((pivot1, leaf1_end), thickness)
-            leaf2 = _radius_to_rect((pivot2, leaf2_end), thickness)
-            arc = _extract_long_arc(cnt, leaf1_end, leaf2_end)
+            # Force each leaf to be perpendicular to the shared viewing line.
+            leaf1_end = _perpendicular_end(pivot1, pivot2, leaf1_end)
+            leaf2_end = _perpendicular_end(pivot2, pivot1, leaf2_end)
+            leaf1 = [pivot1, leaf1_end]
+            leaf2 = [pivot2, leaf2_end]
+            arc = _extract_arc(cnt, leaf1_end, leaf2_end, pivots=[pivot1, pivot2])
 
             doors.append({
                 'type': 'double',
@@ -619,8 +744,10 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
             viewing_line = list(radii[viewing_idx])
             leaf_radius = radii[1 - viewing_idx]
 
-            leaf = _radius_to_rect(leaf_radius, thickness)
-            arc = _extract_long_arc(cnt, end1, end2)
+            # Force the leaf to be exactly perpendicular to the viewing line.
+            leaf_end = _perpendicular_end(pivot, viewing_line[1], leaf_radius[1])
+            leaf = [pivot, leaf_end]
+            arc = _extract_arc(cnt, end1, end2, pivots=[pivot])
 
             if leaf:
                 doors.append({
@@ -693,6 +820,46 @@ def _merge_collinear_segments(poly, angle_tol_deg=10.0):
 
     result.append(poly[-1])
     return result
+
+
+def _orthogonalize_details(polys, angle_tol_deg=2.0):
+    """Snap DETAILS edges that are within ``angle_tol_deg`` of horizontal or
+    vertical to exact axis alignment.
+
+    Furniture and fixtures are mostly orthogonal; skeletonization/vectorisation
+    can leave edges tilted by a fraction of a degree.  This correction removes
+    that drift without affecting genuinely diagonal lines (45° hatching, etc.).
+    """
+    if not polys:
+        return polys
+    tol = math.radians(angle_tol_deg)
+    out = []
+    for poly in polys:
+        if len(poly) < 2:
+            out.append(poly)
+            continue
+        closed = _poly_is_closed(poly)
+        res = [poly[0]]
+        for i in range(len(poly) - 1):
+            x1, y1 = res[-1]
+            x2, y2 = poly[i + 1]
+            dx, dy = x2 - x1, y2 - y1
+            length = math.hypot(dx, dy)
+            if length < 1e-6:
+                continue
+            ang = math.atan2(dy, dx)
+            quad = round(ang / (math.pi / 2)) * (math.pi / 2)
+            delta = abs(((ang - quad + math.pi) % (2 * math.pi)) - math.pi)
+            if delta <= tol:
+                nx = x1 + length * math.cos(quad)
+                ny = y1 + length * math.sin(quad)
+            else:
+                nx, ny = x2, y2
+            res.append((nx, ny))
+        if closed and len(res) >= 2:
+            res[-1] = res[0]
+        out.append(res)
+    return out
 
 
 def _reconnect_polylines(polys, reconnect_tol=5.0, angle_tol=60.0):
@@ -920,7 +1087,8 @@ def trace_details(detail_mask, min_length=1, eps_frac=0.001, close_gap=2):
             approx.reshape(-1, 2).astype(float).tolist(),
             angle_tol_deg=10.0,
         )
-        smoothed.append(merged)
+        ortho = _orthogonalize_details([merged], angle_tol_deg=2.0)
+        smoothed.append(ortho[0])
     return smoothed
 
 
@@ -958,9 +1126,6 @@ def emit_dxf(wall_polys, windows, doors, details, scale, x0, y0):
             # Viewing / frame line.
             msp.add_lwpolyline(px_to_mm(door['viewing_line'], scale, x0, y0),
                                close=False, dxfattribs=attr)
-            # Door leaf: thin rectangle.
-            msp.add_lwpolyline(px_to_mm(door['leaf'], scale, x0, y0),
-                               close=True, dxfattribs=attr)
             # Swing arc traced from the red contour.
             arc_mm = px_to_mm(door['arc'], scale, x0, y0)
             if len(arc_mm) >= 2:
@@ -970,10 +1135,6 @@ def emit_dxf(wall_polys, windows, doors, details, scale, x0, y0):
             # Shared viewing line.
             msp.add_lwpolyline(px_to_mm(door['viewing_line'], scale, x0, y0),
                                close=False, dxfattribs=attr)
-            # Two door leaves.
-            for leaf in door['leaves']:
-                msp.add_lwpolyline(px_to_mm(leaf, scale, x0, y0),
-                                   close=True, dxfattribs=attr)
             # Outer S-curve arc.
             arc_mm = px_to_mm(door['arc'], scale, x0, y0)
             if len(arc_mm) >= 2:
@@ -1009,16 +1170,11 @@ def render_preview(shape, wall_polys, windows, doors, details, out_path):
             cv2.polylines(canvas, [np.array(pl, np.int32)], False, (0, 160, 0), 2)
     for door in doors:
         if door['type'] == 'swing':
-            leaf = np.array(door['leaf'], np.int32).reshape(-1, 1, 2)
-            cv2.polylines(canvas, [leaf], True, (0, 0, 200), 2)
             arc = np.array(door['arc'], np.int32).reshape(-1, 1, 2)
             cv2.polylines(canvas, [arc], False, (0, 0, 200), 2)
             line = np.array(door['viewing_line'], np.int32)
             cv2.line(canvas, tuple(line[0]), tuple(line[1]), (0, 0, 200), 2)
         elif door['type'] == 'double':
-            for leaf in door['leaves']:
-                pts = np.array(leaf, np.int32).reshape(-1, 1, 2)
-                cv2.polylines(canvas, [pts], True, (0, 0, 200), 2)
             arc = np.array(door['arc'], np.int32).reshape(-1, 1, 2)
             cv2.polylines(canvas, [arc], False, (0, 0, 200), 2)
             line = np.array(door['viewing_line'], np.int32)
