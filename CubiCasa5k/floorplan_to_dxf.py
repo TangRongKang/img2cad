@@ -74,7 +74,7 @@ def get_annotated_image(args):
         model=args.model,
         prompt=ANNOTATE_PROMPT,
         aspect_ratio='auto',
-        image_size='auto',
+        image_size='4k',
         batch_size=1,
         image_list=[ref_img],
     )
