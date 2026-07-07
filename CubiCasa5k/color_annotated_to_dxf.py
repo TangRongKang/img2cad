@@ -338,14 +338,53 @@ def trace_windows(green_c, x_lines, y_lines, wall_t, min_area=500, min_fill=0.20
 
 # ── stage 3: doors (trace red regions as precise closed contours) ────────────────
 
-def trace_doors(red_c, wall_t, min_area=80):
-    """Trace every red region as a precise closed polyline.
+def _fit_straight_door(cnt, x_lines, y_lines, wall_t):
+    """Fit an axis-aligned red region as a rectangular door/sliding panel and
+    snap its ends flush to the nearest wall lines.
 
-    Unlike the previous sector-based reconstruction (hinge + leaf + arc), this
-    simply emits the contour of whatever the AI coloured red.  It therefore
-    handles swing doors, sliding doors, double doors, or any other door symbol
-    without assuming a particular geometry — the output hugs the annotated
-    shape as closely as possible.
+    Returns the 4-corner polygon or None if the contour is not rectangular
+    enough (e.g. a swing-door sector with an arc).
+    """
+    area = cv2.contourArea(cnt)
+    bx, by, bw, bh = cv2.boundingRect(cnt)
+    if bw * bh < 1:
+        return None
+    fill = area / (bw * bh)
+    aspect = max(bw, bh) / (min(bw, bh) + 1e-9)
+    # Sliding doors / door leaves are compact rectangles; swing-door sectors
+    # that include a quarter-circle fill their bbox poorly OR have a square-ish
+    # bbox.  Allow low fill only for very elongated panels (sliding doors).
+    if aspect >= 2.5:
+        if fill < 0.22:
+            return None
+    elif aspect >= 1.8:
+        if fill < 0.55:
+            return None
+    else:
+        # Near-square regions are usually swing-door sectors with an arc; only
+        # accept them as rectangles if they are almost completely solid.
+        if fill < 0.88:
+            return None
+
+    face_tol, end_tol = wall_t * 0.9, wall_t * 0.8
+    if bw >= bh:                          # horizontal panel
+        y1, y2 = _snap_pair(by, by + bh, y_lines, face_tol)
+        x1 = _snap1(bx, x_lines, end_tol)
+        x2 = _snap1(bx + bw, x_lines, end_tol)
+    else:                                 # vertical panel
+        x1, x2 = _snap_pair(bx, bx + bw, x_lines, face_tol)
+        y1 = _snap1(by, y_lines, end_tol)
+        y2 = _snap1(by + bh, y_lines, end_tol)
+    return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+
+def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
+    """Trace red door symbols.
+
+    - Sliding / swing door leaves are axis-aligned rectangles: snap their
+      ends to the wall lattice so they sit flush in the opening.
+    - Swing-door sectors with arcs keep their original contour but use a much
+      finer polyline so the arc looks smooth instead of jagged.
     """
     cnts, _ = cv2.findContours(red_c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     polys = []
@@ -353,8 +392,17 @@ def trace_doors(red_c, wall_t, min_area=80):
         area = cv2.contourArea(cnt)
         if area < min_area:
             continue
+
+        # Try rectangular panel first (sliding doors / plain door leaves)
+        if x_lines is not None and y_lines is not None:
+            rect = _fit_straight_door(cnt, x_lines, y_lines, wall_t)
+            if rect is not None:
+                polys.append(rect)
+                continue
+
+        # Fallback: high-resolution contour for arcs / arbitrary symbols
         peri = cv2.arcLength(cnt, True)
-        eps = max(1.0, peri * 0.005)
+        eps = max(0.35, peri * 0.0008)
         approx = cv2.approxPolyDP(cnt, eps, True).reshape(-1, 2)
         if len(approx) < 3:
             continue
@@ -727,9 +775,9 @@ def convert_annotated_image(img_bgr, output_dxf, width_mm=None, scale=None,
     # trace → regularise → emit
     wall_polys, x_lines, y_lines = trace_walls(blue_w, wall_t)
     windows = trace_windows(green_c, x_lines, y_lines, wall_t)
-    # Doors are traced directly as the red-region contours, so swing doors,
-    # sliding doors, and double doors are all handled by the same path.
-    doors   = trace_doors(red_c, wall_t)
+    # Doors: pass wall lattice so straight leaves snap flush to walls; arcs keep
+    # high-resolution contours for a smooth curve.
+    doors   = trace_doors(red_c, wall_t, x_lines, y_lines)
     details = [] if no_details else trace_details(make_detail_mask(img_bgr, blue, red, green))
     print(f'Extracted: walls={len(wall_polys)}, doors={len(doors)}, '
           f'windows={len(windows)}, details={len(details)}')
