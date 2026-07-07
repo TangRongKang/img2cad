@@ -379,12 +379,11 @@ def _fit_straight_door(cnt, x_lines, y_lines, wall_t):
 
 
 def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
-    """Trace red door symbols.
+    """Trace red door symbols as high-resolution contours.
 
-    - Sliding / swing door leaves are axis-aligned rectangles: snap their
-      ends to the wall lattice so they sit flush in the opening.
-    - Swing-door sectors with arcs keep their original contour but use a much
-      finer polyline so the arc looks smooth instead of jagged.
+    With 4k annotated images the raw contour is already smooth and accurate
+    enough, so we keep every door symbol exactly as the AI coloured it rather
+    than trying to fit rectangles or snap to walls.
     """
     cnts, _ = cv2.findContours(red_c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     polys = []
@@ -392,15 +391,6 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
         area = cv2.contourArea(cnt)
         if area < min_area:
             continue
-
-        # Try rectangular panel first (sliding doors / plain door leaves)
-        if x_lines is not None and y_lines is not None:
-            rect = _fit_straight_door(cnt, x_lines, y_lines, wall_t)
-            if rect is not None:
-                polys.append(rect)
-                continue
-
-        # Fallback: high-resolution contour for arcs / arbitrary symbols
         peri = cv2.arcLength(cnt, True)
         eps = max(0.35, peri * 0.0008)
         approx = cv2.approxPolyDP(cnt, eps, True).reshape(-1, 2)
