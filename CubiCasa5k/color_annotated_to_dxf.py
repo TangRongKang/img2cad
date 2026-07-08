@@ -774,12 +774,18 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
 
 # ── details (everything else, traced as-is) ─────────────────────────────────────
 
-def make_detail_mask(img_bgr, blue_raw, green_raw):
+def make_detail_mask(img_bgr, blue_w, green_c):
     """Binary mask of non-wall/window dark content (doors are kept as details)."""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     _, fg = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    color_union = cv2.dilate(cv2.bitwise_or(blue_raw, green_raw), k)
+
+    # Dilate the cleaned wall/window masks so that the residual dark
+    # anti-aliased halo around coloured regions is excluded from details.
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    wall_region = cv2.dilate(blue_w, k)
+    win_region = cv2.dilate(green_c, k)
+
+    color_union = cv2.bitwise_or(wall_region, win_region)
     detail = cv2.bitwise_and(fg, cv2.bitwise_not(color_union))
     # Small CLOSE (not OPEN) to bridge 1-2px gaps in thin lines without
     # thickening them significantly. This reduces broken detail segments
@@ -1215,7 +1221,7 @@ def convert_annotated_image(img_bgr, output_dxf, width_mm=None, scale=None,
     wall_polys, x_lines, y_lines = trace_walls(blue_w, wall_t)
     windows = trace_windows(green_c, x_lines, y_lines, wall_t)
     doors   = []
-    details = [] if no_details else trace_details(make_detail_mask(img_bgr, blue, green))
+    details = [] if no_details else trace_details(make_detail_mask(img_bgr, blue_w, green_c))
     print(f'Extracted: walls={len(wall_polys)}, doors={len(doors)}, '
           f'windows={len(windows)}, details={len(details)}')
 
