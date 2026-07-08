@@ -4,9 +4,8 @@ color_annotated_to_dxf.py
 
 Convert a color-annotated floor plan image to DXF.
   Blue  → WALLS
-  Red   → DOORS
   Green → WINDOWS
-  other dark content → DETAILS
+  other dark content (including doors) → DETAILS
 
 Method — trace each colour in place, then regularise:
   1. trace walls/windows/doors from their colour masks (no relocation).
@@ -704,7 +703,9 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
         kind, info = _classify_corners(approx, corners)
 
         if kind == 'double':
-            # Double swing door: shared viewing line + two leaves + one outer arc.
+            # Double swing door: combine shared viewing line, two leaves and the
+            # outer S-curve into ONE closed polyline, then clean it with the same
+            # post-processing used for DETAILS.
             n = len(approx)
             i1, i2 = info
             pivot1 = tuple(float(v) for v in approx[i1])
@@ -723,16 +724,23 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
             leaf2_end = _perpendicular_end(pivot2, pivot1, leaf2_end)
             leaf1 = [pivot1, leaf1_end]
             leaf2 = [pivot2, leaf2_end]
-            arc = _extract_arc(cnt, leaf1_end, leaf2_end, pivots=[pivot1, pivot2])
+
+            # Outer arc runs from leaf2_end back to leaf1_end.
+            arc = _extract_arc(cnt, leaf2_end, leaf1_end, pivots=[pivot1, pivot2])
+
+            outline = [pivot1]
+            outline.extend(viewing_line[1:])   # pivot1 -> pivot2
+            outline.extend(leaf2[1:])          # pivot2 -> leaf2_end
+            outline.extend(arc[1:])            # leaf2_end -> ... -> leaf1_end
+            outline.append(pivot1)             # leaf1_end -> pivot1 (close)
 
             doors.append({
-                'type': 'double',
-                'viewing_line': viewing_line,
-                'leaves': [leaf1, leaf2],
-                'arc': arc,
+                'type': 'outline',
+                'poly': _process_detail_style(outline),
             })
         elif kind == 'single':
-            # Single swing door: one right-angle corner = pivot.
+            # Single swing door: combine viewing line, leaf and outer arc into
+            # ONE closed polyline, then clean it with DETAILS-style processing.
             i = info
             n = len(approx)
             pivot = tuple(float(v) for v in approx[i])
@@ -747,28 +755,31 @@ def trace_doors(red_c, wall_t, x_lines=None, y_lines=None, min_area=80):
             # Force the leaf to be exactly perpendicular to the viewing line.
             leaf_end = _perpendicular_end(pivot, viewing_line[1], leaf_radius[1])
             leaf = [pivot, leaf_end]
-            arc = _extract_arc(cnt, end1, end2, pivots=[pivot])
 
-            if leaf:
-                doors.append({
-                    'type': 'swing',
-                    'viewing_line': viewing_line,
-                    'leaf': leaf,
-                    'arc': arc,
-                })
+            # Outer arc runs from viewing-line end to leaf end.
+            arc = _extract_arc(cnt, viewing_line[1], leaf_end, pivots=[pivot])
+
+            outline = [pivot]
+            outline.extend(viewing_line[1:])   # pivot -> view_end
+            outline.extend(arc[1:])            # view_end -> ... -> leaf_end
+            outline.append(pivot)              # leaf_end -> pivot (close)
+
+            doors.append({
+                'type': 'outline',
+                'poly': _process_detail_style(outline),
+            })
     return doors
 
 
 
 # ── details (everything else, traced as-is) ─────────────────────────────────────
 
-def make_detail_mask(img_bgr, blue_raw, red_raw, green_raw):
-    """Binary mask of non-wall/door/window dark content."""
+def make_detail_mask(img_bgr, blue_raw, green_raw):
+    """Binary mask of non-wall/window dark content (doors are kept as details)."""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     _, fg = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    color_union = cv2.dilate(
-        cv2.bitwise_or(cv2.bitwise_or(blue_raw, red_raw), green_raw), k)
+    color_union = cv2.dilate(cv2.bitwise_or(blue_raw, green_raw), k)
     detail = cv2.bitwise_and(fg, cv2.bitwise_not(color_union))
     # Small CLOSE (not OPEN) to bridge 1-2px gaps in thin lines without
     # thickening them significantly. This reduces broken detail segments
@@ -860,6 +871,19 @@ def _orthogonalize_details(polys, angle_tol_deg=2.0):
             res[-1] = res[0]
         out.append(res)
     return out
+
+
+def _process_detail_style(poly):
+    """Apply DETAILS-layer post-processing to a single polyline.
+
+    Merges nearly-collinear consecutive edges and then snaps any edge that is
+    within 2° of horizontal/vertical to exact axis alignment.  This is the same
+    cleanup used for furniture/details, applied here to door components so the
+    leaf and viewing line are clean single segments.
+    """
+    merged = _merge_collinear_segments(poly, angle_tol_deg=10.0)
+    ortho = _orthogonalize_details([merged], angle_tol_deg=2.0)
+    return ortho[0]
 
 
 def _reconnect_polylines(polys, reconnect_tol=5.0, angle_tol=60.0):
@@ -1100,12 +1124,8 @@ def emit_dxf(wall_polys, windows, doors, details, scale, x0, y0):
     doc.header['$LTSCALE'] = 1
     msp = doc.modelspace()
     doc.layers.add('WALLS',   color=7, lineweight=35)
-    doc.layers.add('DOORS',   color=1, lineweight=25)
     doc.layers.add('WINDOWS', color=4, lineweight=25)
     doc.layers.add('DETAILS', color=8, lineweight=13)
-    # Dense dashed linetype for door arcs (80 mm dash, 40 mm gap)
-    _lt = doc.linetypes.new('DOOR_DASH', dxfattribs={'description': 'Door arc dashes'})
-    _lt.setup_pattern([120.0, 80.0, -40.0])
 
     for poly in wall_polys:
         if len(poly) >= 3:
@@ -1120,31 +1140,6 @@ def emit_dxf(wall_polys, windows, doors, details, scale, x0, y0):
             if len(mm) >= 2:
                 msp.add_lwpolyline(mm, close=False, dxfattribs=attr)
 
-    for door in doors:
-        attr = {'layer': 'DOORS'}
-        if door['type'] == 'swing':
-            # Viewing / frame line.
-            msp.add_lwpolyline(px_to_mm(door['viewing_line'], scale, x0, y0),
-                               close=False, dxfattribs=attr)
-            # Swing arc traced from the red contour.
-            arc_mm = px_to_mm(door['arc'], scale, x0, y0)
-            if len(arc_mm) >= 2:
-                msp.add_lwpolyline(arc_mm, close=False,
-                                   dxfattribs={**attr, 'linetype': 'DOOR_DASH'})
-        elif door['type'] == 'double':
-            # Shared viewing line.
-            msp.add_lwpolyline(px_to_mm(door['viewing_line'], scale, x0, y0),
-                               close=False, dxfattribs=attr)
-            # Outer S-curve arc.
-            arc_mm = px_to_mm(door['arc'], scale, x0, y0)
-            if len(arc_mm) >= 2:
-                msp.add_lwpolyline(arc_mm, close=False,
-                                   dxfattribs={**attr, 'linetype': 'DOOR_DASH'})
-        else:
-            for rect in door['rects']:
-                msp.add_lwpolyline(px_to_mm(rect, scale, x0, y0),
-                                   close=True, dxfattribs=attr)
-
     for poly in details:
         if len(poly) >= 2:
             closed = _poly_is_closed(poly)
@@ -1153,7 +1148,7 @@ def emit_dxf(wall_polys, windows, doors, details, scale, x0, y0):
     return doc
 
 
-def render_preview(shape, wall_polys, windows, doors, details, out_path):
+def render_preview(shape, wall_polys, windows, details, out_path):
     canvas = np.ones((shape[0], shape[1], 3), np.uint8) * 255
     for poly in details:
         if len(poly) < 2:
@@ -1168,21 +1163,6 @@ def render_preview(shape, wall_polys, windows, doors, details, out_path):
         cv2.polylines(canvas, [np.array(win['poly'], np.int32)], True, (0, 160, 0), 2)
         for pl in win['lines']:
             cv2.polylines(canvas, [np.array(pl, np.int32)], False, (0, 160, 0), 2)
-    for door in doors:
-        if door['type'] == 'swing':
-            arc = np.array(door['arc'], np.int32).reshape(-1, 1, 2)
-            cv2.polylines(canvas, [arc], False, (0, 0, 200), 2)
-            line = np.array(door['viewing_line'], np.int32)
-            cv2.line(canvas, tuple(line[0]), tuple(line[1]), (0, 0, 200), 2)
-        elif door['type'] == 'double':
-            arc = np.array(door['arc'], np.int32).reshape(-1, 1, 2)
-            cv2.polylines(canvas, [arc], False, (0, 0, 200), 2)
-            line = np.array(door['viewing_line'], np.int32)
-            cv2.line(canvas, tuple(line[0]), tuple(line[1]), (0, 0, 200), 2)
-        else:
-            for rect in door['rects']:
-                pts = np.array(rect, np.int32).reshape(-1, 1, 2)
-                cv2.polylines(canvas, [pts], True, (0, 0, 200), 2)
     cv2.imwrite(out_path, canvas)
     print(f'Preview → {out_path}')
 
@@ -1208,18 +1188,10 @@ def convert_annotated_image(img_bgr, output_dxf, width_mm=None, scale=None,
 
     hsv   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     blue  = cv2.inRange(hsv, BLUE_LO, BLUE_HI)
-    red   = cv2.bitwise_or(cv2.inRange(hsv, RED_LO1, RED_HI1),
-                           cv2.inRange(hsv, RED_LO2, RED_HI2))
     green = cv2.inRange(hsv, GREEN_LO, GREEN_HI)
 
     blue_w  = morph_clean(blue, close_k=3, open_k=3, close_iter=1)   # sharp — wall geometry
     blue_c  = smooth_edges(blue_w, sigma=2.0)                        # smoothed — thickness/struct
-    # Doors are thin outline arcs or rails: open(2) to drop speckle, then a close
-    # to consolidate each symbol — keeping the contour intact so it can be traced
-    # as-is (smoothing/large opening would distort the shape).
-    red_o   = cv2.morphologyEx(red, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    red_c   = cv2.morphologyEx(red_o, cv2.MORPH_CLOSE,
-                               cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
     green_c = morph_clean(green, close_k=5, open_k=3, close_iter=2)
 
     cols = np.where(blue.any(axis=0))[0]
@@ -1242,10 +1214,8 @@ def convert_annotated_image(img_bgr, output_dxf, width_mm=None, scale=None,
     # trace → regularise → emit
     wall_polys, x_lines, y_lines = trace_walls(blue_w, wall_t)
     windows = trace_windows(green_c, x_lines, y_lines, wall_t)
-    # Doors: pass wall lattice so straight leaves snap flush to walls; arcs keep
-    # high-resolution contours for a smooth curve.
-    doors   = trace_doors(red_c, wall_t, x_lines, y_lines)
-    details = [] if no_details else trace_details(make_detail_mask(img_bgr, blue, red, green))
+    doors   = []
+    details = [] if no_details else trace_details(make_detail_mask(img_bgr, blue, green))
     print(f'Extracted: walls={len(wall_polys)}, doors={len(doors)}, '
           f'windows={len(windows)}, details={len(details)}')
 
@@ -1254,7 +1224,7 @@ def convert_annotated_image(img_bgr, output_dxf, width_mm=None, scale=None,
     print(f'Saved: {output_dxf}')
 
     if save_preview:
-        render_preview((H, W), wall_polys, windows, doors, details,
+        render_preview((H, W), wall_polys, windows, details,
                        output_dxf.rsplit('.', 1)[0] + '_preview.png')
 
     return output_dxf
