@@ -244,20 +244,30 @@ def trace_walls(blue_c, wall_t, min_area=400):
 # ── stage 3: windows (snap faces & ends to the wall lattice) ─────────────────────
 
 def _straight_window(bx, by, bw, bh, x_lines, y_lines, wall_t):
-    """One straight window snapped flush into its wall. Returns (poly, lines)."""
+    """One straight window snapped flush into its wall. Returns (poly, lines).
+
+    The window is represented by two inner parallel lines at the 1/3 and 2/3
+    positions across its thickness (typical window-symbol convention).
+    """
     face_tol, end_tol = wall_t * 0.9, wall_t * 0.7
     if bw >= bh:                          # horizontal: thickness in y, length in x
         y1, y2 = _snap_pair(by, by + bh, y_lines, face_tol)
         x1 = _snap1(bx, x_lines, end_tol)
         x2 = _snap1(bx + bw, x_lines, end_tol)
-        cy = (y1 + y2) / 2
-        lines = [[(x1, cy), (x2, cy)]]
+        t = (y2 - y1) / 3.0
+        lines = [
+            [(x1, y1 + t), (x2, y1 + t)],
+            [(x1, y2 - t), (x2, y2 - t)],
+        ]
     else:                                 # vertical: thickness in x, length in y
         x1, x2 = _snap_pair(bx, bx + bw, x_lines, face_tol)
         y1 = _snap1(by, y_lines, end_tol)
         y2 = _snap1(by + bh, y_lines, end_tol)
-        cx = (x1 + x2) / 2
-        lines = [[(cx, y1), (cx, y2)]]
+        t = (x2 - x1) / 3.0
+        lines = [
+            [(x1 + t, y1), (x1 + t, y2)],
+            [(x2 - t, y1), (x2 - t, y2)],
+        ]
     poly = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
     return poly, lines
 
