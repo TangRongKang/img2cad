@@ -1,0 +1,7 @@
+requests>=2.31
+Pillow>=10.0
+opencv-python>=4.8
+numpy>=1.24
+ezdxf>=1.1
+shapely>=2.0
+scikit-image>=0.22
