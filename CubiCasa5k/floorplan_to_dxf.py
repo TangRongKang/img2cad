@@ -23,10 +23,9 @@ from PIL import Image
 from znzmo_client import ZnzmoClient
 from color_annotated_to_dxf import convert_annotated_image
 
-# 复用 test_znzmo_image.py 里的标注提示词：
-# 设计原则（通用，不针对单张图打补丁）：
+# 知末 AI 彩色标注提示词（通用，不针对单张图打补丁）：
 #   ① 原地重新着色，绝不重绘/简化/增删几何；
-#   ② 墙/门/窗→蓝/红/绿实心，其余图元一律保留为黑线；
+#   ② 墙/窗 → 蓝/绿实心，门与其它图元一律保留为黑线；
 #   ③ 所有墙（含最外圈外轮廓）都必须着色；
 #   ④ 显式处理深色/黑底 CAD 源图。
 ANNOTATE_PROMPT = (
